@@ -21,7 +21,23 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+try:
+    from google import genai as google_genai
+    from google.genai import types as genai_types
+except ImportError:
+    google_genai = None
+    genai_types = None
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+
+try:
+    from openai import OpenAI, OpenAIError
+except ImportError:
+    OpenAI = None
+    OpenAIError = Exception
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -242,28 +258,98 @@ class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
-class OpenAIGenerator:
+class GeminiGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "").strip()
+        api_key = (
+            os.getenv("GEMINI_API_KEY", "").strip()
+            or os.getenv("OPENAI_API_KEY", "").strip()
+        )
+        self.primary_model = (
+            os.getenv("GEMINI_MODEL", "").strip()
+            or os.getenv("OPENAI_MODEL", "").strip()
+            or "gemini-3.5-flash"
+        )
+        self.fallback_models = [
+            self.primary_model,
+            "gemini-3.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-flash-lite-latest",
+            "gemini-3.6-flash",
+        ]
+        # preserve unique ordered models
+        seen = set()
+        self.models_to_try = [m for m in self.fallback_models if not (m in seen or seen.add(m))]
+
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing from .env")
-        if not self.model:
-            raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
         self.max_output_tokens = max_output_tokens
 
+        if google_genai is not None:
+            self._client = google_genai.Client(api_key=api_key)
+            self._mode = "google_genai"
+        elif genai is not None:
+            genai.configure(api_key=api_key)
+            self._mode = "genai"
+        elif OpenAI is not None:
+            self._client = OpenAI(
+                api_key=api_key,
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            )
+            self._mode = "openai_compat"
+        else:
+            raise RuntimeError("Neither google-genai nor google-generativeai nor openai SDK is installed.")
+
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
-        if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
-        return answer
+        last_exc = None
+        for model in self.models_to_try:
+            for attempt in range(3):
+                try:
+                    if self._mode == "google_genai":
+                        res = self._client.models.generate_content(
+                            model=model,
+                            contents=prompt,
+                            config=genai_types.GenerateContentConfig(
+                                max_output_tokens=self.max_output_tokens,
+                                temperature=0.0,
+                            ),
+                        )
+                        answer = res.text.strip() if (res and res.text) else ""
+                    elif self._mode == "genai":
+                        genai_model = genai.GenerativeModel(model)
+                        res = genai_model.generate_content(
+                            prompt,
+                            generation_config=genai.types.GenerationConfig(
+                                max_output_tokens=self.max_output_tokens,
+                                temperature=0.0,
+                            ),
+                        )
+                        answer = res.text.strip() if (res and res.text) else ""
+                    else:
+                        res = self._client.chat.completions.create(
+                            model=model,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                            max_tokens=self.max_output_tokens,
+                        )
+                        answer = res.choices[0].message.content.strip() if res.choices else ""
+
+                    if answer:
+                        return answer
+                except Exception as exc:
+                    last_exc = exc
+                    err_str = str(exc).lower()
+                    if "resource" in err_str or "quota" in err_str or "429" in err_str:
+                        # quota exceeded for this model, try next model immediately
+                        break
+                    time.sleep(2)
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Gemini returned an empty answer")
+
+
+# Alias for backward compatibility
+OpenAIGenerator = GeminiGenerator
 
 
 @dataclass(frozen=True)
@@ -299,7 +385,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else GeminiGenerator(),
             top_k,
         )
 
